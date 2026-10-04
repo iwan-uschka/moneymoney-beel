@@ -129,9 +129,12 @@ end
 local LOGIN_FAILED = {"LoginFailed"}
 
 -- routes: list of {match = "<plain substring of url>", respond = function(req) -> body}
--- Unmatched requests fail the test.
-local function sandbox(routes, storage)
+-- Unmatched requests fail the test. `now` pins os.time() for exact boundaries.
+local function sandbox(routes, storage, now)
   local env = setmetatable({}, {__index = _G})
+  if now then
+    env.os = setmetatable({time = function(t) return t and os.time(t) or now end}, {__index = os})
+  end
   local log = {requests = {}, cookies = {}}
 
   local conn = {}
@@ -194,12 +197,16 @@ end
 local ME = trpc_ok('{"customerId":"11111111-2222-4333-8444-555555555555","email":"' .. EMAIL
   .. '","name":"Erika","surname":"Mustermann","type":"Investor"}')
 
+-- shares_json / price_json replace the shareAmount / pricePerToken JSON values
+-- verbatim, for malformed or non-string inputs.
 local function item(t)
-  return string.format('{"companyName":%q,"itemId":%q,"pricePerToken":"{\\"tickerName\\":\\"%s\\",'
-    .. '\\"value\\":\\"%s\\"}","productType":%q,"shareAmount":%q,"status":%q,"tokenTickerName":%q}',
-    t.company or "Muster Bau GmbH", t.id or "item-1", t.ticker or "€", t.price or "21000",
-    t.product or "PrivateOffer", t.shares or "23809523809523809523", t.status or "Accepted",
-    t.token or "MUB01")
+  local price_json = t.price_json or string.format('"{\\"tickerName\\":\\"%s\\",\\"value\\":\\"%s\\"}"',
+    t.ticker or "€", t.price or "21000")
+  local shares_json = t.shares_json or string.format("%q", t.shares or "23809523809523809523")
+  return string.format('{"companyName":%q,"itemId":%q,"pricePerToken":%s,"productType":%q,'
+    .. '"shareAmount":%s,"status":%q,"tokenTickerName":%q}',
+    t.company or "Muster Bau GmbH", t.id or "item-1", price_json,
+    t.product or "PrivateOffer", shares_json, t.status or "Accepted", t.token or "MUB01")
 end
 
 local function list_page(items, total)
@@ -242,8 +249,11 @@ local function eq(actual, expected, what)
   end
 end
 
+-- Relative tolerance, so tiny expected values (5e-18) are checked as strictly
+-- as large ones; an expected 0 gets a small absolute tolerance instead.
 local function near(actual, expected, what)
-  if type(actual) ~= "number" or math.abs(actual - expected) > 1e-9 * math.max(1, math.abs(expected)) then
+  local tol = expected == 0 and 1e-12 or 1e-9 * math.abs(expected)
+  if type(actual) ~= "number" or math.abs(actual - expected) > tol then
     error((what or "value") .. ": expected ~" .. tostring(expected) .. ", got " .. tostring(actual), 2)
   end
 end
@@ -254,6 +264,7 @@ local function contains(s, fragment, what)
   end
 end
 
+-- breaks-if: SupportsBank stops comparing bankCode (the extension claims every bank)
 test("SupportsBank accepts only the beel service", function()
   local env = sandbox({})
   eq(env.SupportsBank("WebBanking", "beel"), true)
@@ -308,7 +319,7 @@ test("step 1 rejects a username that is not an email, without network", function
   eq(#log.requests, 0)
 end)
 
--- breaks-if: the 6-digit check is loosened (e.g. %d+), spending Privy's 5/minute rate limit on typos
+-- breaks-if: the 6-digit check is loosened (e.g. %d+), spending Privy's 5-requests-per-window rate limit on typos
 test("step 2 rejects codes that are not exactly 6 digits, without network", function()
   for _, bad in ipairs({"12345", "1234567", "12a456", "", "١٢٣٤٥٦"}) do
     local env, log = sandbox(standard_routes())
@@ -395,16 +406,19 @@ end)
 
 -- breaks-if: the TOKEN_MIN_REMAINING margin is removed (token expires mid-sync)
 test("a cached token that expires within 5 minutes is discarded", function()
-  local storage = {privyToken = make_jwt(os.time() + 299), privyEmail = EMAIL}
-  local env, log = sandbox(standard_routes(), storage)
+  local now = 1800000000
+  local storage = {privyToken = make_jwt(now + 299), privyEmail = EMAIL}
+  local env, log = sandbox(standard_routes(), storage, now)
   eq(type(env.InitializeSession2("WebBanking", "beel", 1, {EMAIL, "x"}, true)), "table")
   eq(requests_to(log, "customer.getMe"), 0)
   eq(storage.privyToken, nil, "expired token cleared")
 end)
 
-test("a cached token with 5+ minutes left is used (boundary)", function()
-  local storage = {privyToken = make_jwt(os.time() + 302), privyEmail = EMAIL}
-  local env = sandbox(standard_routes(), storage)
+-- breaks-if: the remaining-validity check becomes "<=" (a token with exactly 300 s left is dropped)
+test("a cached token with exactly 5 minutes left is used (boundary)", function()
+  local now = 1800000000
+  local storage = {privyToken = make_jwt(now + 300), privyEmail = EMAIL}
+  local env = sandbox(standard_routes(), storage, now)
   eq(env.InitializeSession2("WebBanking", "beel", 1, {EMAIL, "x"}, true), nil)
 end)
 
@@ -427,11 +441,55 @@ test("a cached token beel rejects falls back to the email code", function()
   eq(storage.privyToken, nil)
 end)
 
+-- breaks-if: try_cached_session clears the token on any getMe failure, not only UNAUTHORIZED
+test("a network error while probing a cached token keeps the token", function()
+  local token = make_jwt(os.time() + 3600)
+  local storage = {privyToken = token, privyEmail = EMAIL}
+  local env = sandbox(standard_routes{me = function() error("timeout") end}, storage)
+  eq(type(env.InitializeSession2("WebBanking", "beel", 1, {EMAIL, "x"}, true)), "table")
+  eq(storage.privyToken, token)
+end)
+
+-- breaks-if: ListAccounts stops clearing the cached token when getMe answers UNAUTHORIZED
+test("ListAccounts clears the cached token when beel rejects it", function()
+  local storage = {privyToken = make_jwt(os.time() + 3600), privyEmail = EMAIL}
+  local env = sandbox(standard_routes{
+    me = function() return trpc_err("UNAUTHORIZED", 401, "Not logged in") end,
+  }, storage)
+  local ok, err = pcall(env.ListAccounts, {})
+  eq(ok, false)
+  contains(err, "Not logged in")
+  eq(storage.privyToken, nil)
+end)
+
+-- breaks-if: trpc_query returns nil, nil for a result without data.json again
+test("a tRPC result without data errors with a readable message", function()
+  local env = sandbox(standard_routes{list = function() return '[{"result":{"data":null}}]' end})
+  login(env)
+  local ok, err = pcall(env.RefreshAccount, {}, nil)
+  eq(ok, false)
+  contains(err, "leere tRPC-Antwort")
+end)
+
 -- breaks-if: the interactive == false guard is removed (background sync triggers an email)
 test("non-interactive sync without a usable token sends no email", function()
   local env, log = sandbox(standard_routes())
   contains(env.InitializeSession2("WebBanking", "beel", 1, {EMAIL, "x"}, false), "manuell")
   eq(requests_to(log, "/passwordless/init"), 0)
+end)
+
+-- breaks-if: the g_email guard in step 2 is removed (Privy gets "email":"" or the script crashes)
+test("step 2 without step 1 asks to restart the login, without network", function()
+  local env, log = sandbox(standard_routes())
+  contains(env.InitializeSession2("WebBanking", "beel", 2, {"123456"}, true), "erneut starten")
+  eq(#log.requests, 0)
+end)
+
+test("ListAccounts loads the customer itself when the session was reused elsewhere", function()
+  local env, log = sandbox(standard_routes())
+  local accounts = env.ListAccounts({})
+  eq(accounts[1].accountNumber, "11111111-2222-4333-8444-555555555555")
+  eq(requests_to(log, "customer.getMe"), 1)
 end)
 
 test("ListAccounts returns one portfolio account for the customer", function()
@@ -487,6 +545,52 @@ test("token amount boundaries: fewer digits than decimals, exactly 18, zero", fu
   eq(s[4].quantity, 0, "zero")
 end)
 
+test("a numeric or negative shareAmount still converts", function()
+  local env = sandbox(standard_routes{list = function()
+    return list_page({
+      item{id = "n", shares_json = "1000000000000000000"},
+      item{id = "m", shares = "-2000000000000000000"},
+    }, 2)
+  end})
+  login(env)
+  local s = env.RefreshAccount({}, nil).securities
+  near(s[1].quantity, 1, "JSON number")
+  near(s[2].quantity, -2, "negative string")
+end)
+
+-- breaks-if: the "^%-?%d+$" check in fixed_to_number is removed (garbage parses as a quantity)
+test("malformed amounts and prices leave the position unvalued", function()
+  local env = sandbox(standard_routes{list = function()
+    return list_page({
+      item{id = "d", shares = "1.5"},
+      item{id = "a", shares = "abc"},
+      item{id = "p", price_json = '"not json"'},
+    }, 3)
+  end})
+  login(env)
+  local r = env.RefreshAccount({}, nil)
+  eq(r.securities[1].quantity, nil, "decimal string")
+  eq(r.securities[1].amount, nil)
+  eq(r.securities[2].quantity, nil, "letters")
+  eq(r.securities[3].price, nil, "garbage pricePerToken")
+  eq(r.securities[3].amount, nil)
+  eq(r.balance, 0)
+end)
+
+-- breaks-if: unknown tickers (currency nil) are counted into the EUR balance again
+test("an unknown price ticker uses 2 decimals and stays out of the EUR balance", function()
+  local env = sandbox(standard_routes{list = function()
+    return list_page({item{ticker = "CHF", price = "12345", shares = "1000000000000000000"}}, 1)
+  end})
+  login(env)
+  local r = env.RefreshAccount({}, nil)
+  near(r.securities[1].price, 123.45, "2 decimals")
+  eq(r.securities[1].currencyOfPrice, nil)
+  eq(r.securities[1].amount, nil)
+  eq(r.balance, 0)
+end)
+
+-- breaks-if: amount is set for non-EUR prices (the currency check in security_from_item is removed)
 test("stablecoin prices use their own decimals and stay out of the EUR balance", function()
   local env = sandbox(standard_routes{list = function()
     return list_page({
@@ -611,22 +715,58 @@ test("a non-JSON list response errors readably and keeps the token", function()
 end)
 
 -- breaks-if: trpc_query stops wrapping connection:request in pcall
-test("a transport error on the list call errors readably", function()
-  local env = sandbox(standard_routes{list = function() error("HTTP 503") end})
+test("a transport error on the list call errors readably and keeps the token", function()
+  local storage = {}
+  local env = sandbox(standard_routes{list = function() error("HTTP 503") end}, storage)
   login(env)
   local ok, err = pcall(env.RefreshAccount, {}, nil)
   eq(ok, false)
   contains(err, "HTTP 503")
+  eq(type(storage.privyToken), "string")
 end)
 
-test("EndSession resets state; the next login starts again at step 1", function()
+-- breaks-if: is_unauthorized drops the FORBIDDEN code or the "401" message fallback
+test("FORBIDDEN and a transport 401 also clear the cached token", function()
+  local cases = {
+    function() return trpc_err("FORBIDDEN", 403, "Forbidden") end,
+    function() error("HTTP 401 Unauthorized") end,
+  }
+  for i, respond in ipairs(cases) do
+    local storage = {}
+    local env = sandbox(standard_routes{list = respond}, storage)
+    login(env)
+    eq(pcall(env.RefreshAccount, {}, nil), false, "case " .. i)
+    eq(storage.privyToken, nil, "case " .. i .. " token")
+  end
+end)
+
+-- breaks-if: is_unauthorized matches every tRPC error code (a server error logs the user out)
+test("a tRPC server error keeps the cached token", function()
+  local storage = {}
+  local env = sandbox(standard_routes{list = function()
+    return trpc_err("INTERNAL_SERVER_ERROR", 500, "boom")
+  end}, storage)
+  login(env)
+  local ok, err = pcall(env.RefreshAccount, {}, nil)
+  eq(ok, false)
+  contains(err, "boom")
+  eq(type(storage.privyToken), "string")
+end)
+
+-- breaks-if: EndSession stops clearing g_email / g_me (stale session state leaks into the next sync)
+test("EndSession resets session state but keeps the cached token", function()
   local env, log = sandbox(standard_routes(), {})
   login(env)
   env.EndSession()
-  -- A cached token exists now, so step 1 reuses it with a fresh getMe probe.
+  contains(env.InitializeSession2("WebBanking", "beel", 2, {"123456"}, true), "erneut starten",
+           "g_email cleared")
+  env.ListAccounts({})
+  eq(requests_to(log, "customer.getMe"), 2, "g_me cleared, so ListAccounts reloads it")
+  env.EndSession()
+  -- The cached token survives, so step 1 reuses it with a fresh getMe probe.
   eq(env.InitializeSession2("WebBanking", "beel", 1, {EMAIL, "x"}, true), nil)
   eq(requests_to(log, "/passwordless/init"), 1, "no second email")
-  eq(requests_to(log, "customer.getMe"), 2)
+  eq(requests_to(log, "customer.getMe"), 3)
 end)
 
 -- ─────────────────────────────────────────────────────────────────────────────

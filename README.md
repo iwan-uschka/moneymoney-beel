@@ -22,16 +22,16 @@ Adds your [beel](https://beel.com) (formerly tokenize.it) investments to [MoneyM
 2. A dialog asks for the code. Enter the 6 digits from the email.
 3. The extension exchanges the code for a session token and fetches your investments.
 
-The session token is valid for one hour. The extension stores it in MoneyMoney's encrypted database, and syncs within that hour run without a new code. After the hour, the next sync needs a new code.
+The session token is valid for one hour. The extension stores it in MoneyMoney's encrypted database and reuses it while at least 5 minutes of validity remain, so syncs within roughly the first 55 minutes run without a new code. After that, the next sync needs a new code.
 
 ## Known limitations
 
 - **Unsigned extension.** MoneyMoney warns that the extension is not from a verified developer. Allow unsigned extensions under MoneyMoney → Preferences → Extensions.
 - **Dummy password.** MoneyMoney always shows a password field. The extension never uses or sends it. Check "Save password" so MoneyMoney stops asking for it.
-- **No automatic background sync.** An automatic sync can't ask for a code, so it fails once the one-hour token has expired. Refresh the account manually instead.
+- **No automatic background sync.** An automatic sync can't ask for a code, so it fails once the cached token is no longer reused (about 55 minutes after login). Refresh the account manually instead.
 - **Issue price only.** beel publishes no market price for its tokens. Positions are valued at the price per token you paid.
 - **Holdings only.** The extension lists accepted private offers, successful public fundraising investments and active or fulfilled employee participation plans. Pending, cancelled and burned items are skipped. There is no transaction history.
-- **Non-euro positions.** Positions priced in USDC show their price, but the extension can't convert them to EUR, so they don't count toward the account balance.
+- **Non-euro positions.** Positions priced in USDC or an unrecognised currency show their price, but the extension can't convert them to EUR, so they don't count toward the account balance.
 
 ## Technical reference
 

@@ -7,8 +7,8 @@
 -- two-step login dialog.
 --
 -- Privy tokens are valid for one hour. The extension keeps the last token in
--- LocalStorage and reuses it while it is valid, so syncs within that hour need
--- no new code.
+-- LocalStorage and reuses it while at least TOKEN_MIN_REMAINING seconds of
+-- validity remain, so syncs in roughly the first 55 minutes need no new code.
 
 local BASE       = "https://app.beel.com"
 local PRIVY_BASE = "https://privy.app.beel.com"
@@ -219,7 +219,11 @@ local function trpc_query(procedure, input_json)
   end
   local result = entry["result"]
   local data = result and result["data"]
-  return data and data["json"], nil
+  local json = data and data["json"]
+  if json == nil then
+    return nil, {code = "BAD_RESPONSE", message = "leere tRPC-Antwort"}
+  end
+  return json, nil
 end
 
 local function is_unauthorized(err)
@@ -258,8 +262,10 @@ local function try_cached_session(email)
     return false
   end
   set_session_cookies(token, LocalStorage.privyIdToken)
-  if load_me() then return true end
-  clear_cached_token()
+  local ok, err = load_me()
+  if ok then return true end
+  -- A network error says nothing about the token; keep it for the next sync.
+  if is_unauthorized(err) then clear_cached_token() end
   return false
 end
 
@@ -298,13 +304,20 @@ function InitializeSession2(protocol, bankCode, step, credentials, interactive)
     }
   end
 
+  if not g_email then
+    return "Die Anmeldung wurde unterbrochen. Bitte erneut starten."
+  end
+
   local code = trim(credentials and credentials[1]):gsub("%s", "")
   if not code:match("^%d%d%d%d%d%d$") then
     return "Der Code muss aus 6 Ziffern bestehen."
   end
 
+  -- "login-or-sign-up" is the mode the beel web app sends. For an unknown
+  -- email Privy creates a new Privy user here, before the is_new_user check
+  -- below can refuse it; no login-only mode has been verified.
   local dict = privy_post(PRIVY_AUTH_ENDPOINT,
-    '{"email":' .. json_str(g_email or "") .. ',"code":' .. json_str(code)
+    '{"email":' .. json_str(g_email) .. ',"code":' .. json_str(code)
       .. ',"mode":"login-or-sign-up"}',
     "Code prüfen")
   local token = dict["token"]
@@ -331,7 +344,10 @@ end
 function ListAccounts(knownAccounts)
   if not g_me then
     local ok, err = load_me()
-    if not ok then error("customer.getMe fehlgeschlagen: " .. tostring(err and err.message)) end
+    if not ok then
+      if is_unauthorized(err) then clear_cached_token() end
+      error("customer.getMe fehlgeschlagen: " .. tostring(err and err.message))
+    end
   end
   local owner = trim((g_me["name"] or "") .. " " .. (g_me["surname"] or ""))
   return {{
@@ -376,8 +392,9 @@ local function security_from_item(item)
 
   -- beel publishes no market price; the issue price is the only valuation.
   -- amount is in account currency (EUR), so it is only set for EUR prices.
+  -- Unknown tickers (price_currency nil) get no amount rather than a guess.
   local amount
-  if quantity and price and (price_currency == "EUR" or price_currency == nil) then
+  if quantity and price and price_currency == "EUR" then
     amount = quantity * price
   end
 
