@@ -1,4 +1,4 @@
-# MoneyMoney beel — project notes
+# MoneyMoney beel project notes
 
 Single-file MoneyMoney WebBanking extension (`Beel.lua`, Lua 5.3+).
 Syntax check: `luac -p Beel.lua`. Offline tests: `lua tests/run.lua` (stubs
@@ -12,10 +12,10 @@ IBANs, wallet addresses or tokens from a recorded HAR into this repo.
 
 - Login is Privy passwordless email (Privy app id `cm8epvw1k00dkuxlpmreca9n2`,
   custom API host `privy.app.beel.com`):
-  - `POST /api/v1/passwordless/init` with `{"email": ...}` → `{"success":true}`.
+  - `POST /api/v1/passwordless/init` with `{"email": ...}` returns `{"success":true}`.
     Rate limit header says 5 requests per window.
   - `POST /api/v1/passwordless/authenticate` with
-    `{"email","code","mode":"login-or-sign-up"}` → `token` (access JWT,
+    `{"email","code","mode":"login-or-sign-up"}` returns `token` (access JWT,
     ES256, `exp` = `iat` + 3600), `identity_token`, `is_new_user`.
     `refresh_token` is the literal `"deprecated"`, so there is no refresh.
   - Requests carry `privy-app-id`, `privy-client-id`, `privy-client`,
@@ -64,6 +64,6 @@ IBANs, wallet addresses or tokens from a recorded HAR into this repo.
 - `LocalStorage` persists per account across syncs; the extension keeps the
   Privy token there (`privyToken`, `privyIdToken`, `privyEmail`).
 - Security table fields: WKN is `securityNumber`, exchange name is `market`.
-  Unknown fields are silently ignored, so a misspelled field fails without error.
+  MoneyMoney ignores unknown fields, so a misspelled field fails without error.
 - MoneyMoney may keep serving a cached copy of the extension after the `.lua`
   file is replaced. Restart MoneyMoney before judging which version ran.
